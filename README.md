@@ -26,7 +26,7 @@ Usage
 
 ```go
 node := os.Getenv("SNOWFLAKE_NODE")
-nodeID, err := strconv.Atoi(node)
+nodeID, err := strconv.ParseInt(node, 10, 64)
 
 // ...
 
