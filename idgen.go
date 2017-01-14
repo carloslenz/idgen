@@ -9,19 +9,21 @@ import (
 )
 
 type (
-	// Interface provides ID generation. There are are a few implementations available.
+	// Interface provides ID generation. There are a few implementations available.
 	Interface interface {
-		// NewIDs generates n new IDs. The last ID is returned, so for the first subtract
-		// n-1. Each implementation may specify the maximum n it accepts, otherwise an
-		// error is returned. Otherwise noted, overflows and clashes are not checked.
+		// NewIDs generates n new IDs. The last ID is returned, so for the first ID subtract
+		// n-1. Each implementation may specify the maximum accepted n (otherwise an
+		// error is returned). Overflows and clashes are not checked unless an implementation
+		// says so.
 		NewIDs(n int64) (int64, error)
 	}
 )
 
 // NewSnowflake returns an ID generator that follows Twitter's Snowflake algorithm.
-// It provides up to 4096 IDs per millisecond (so it tries to avoid clashes if possible),
-// supports up to 1024 generating nodes until year 2038. One bit is ignored, which could
-// be used to extend the maximum date further.
+// It can generate up to 4096 IDs per millisecond (so it tries to avoid clashes if possible),
+// and supports up to 1024 generating nodes, up until year 2038. ID's Leading bit is always 0
+// so the returned ID is never negative (i.e, 63 of 64 bits are significative).
+// Safe for concurrent use.
 func NewSnowflake(nodeMask int64) Interface {
 	seq := &sequential{}
 	return &snowflake{
@@ -48,9 +50,9 @@ func NewSequential() Interface {
 }
 
 // NewNegSequential returns an ID generator with reproducible results which starts from
-// the lowest possible int64, so it is good for migrations, so when the system becomes
-// active another generator is used, while clashes are avoided implicitly if it generates
-// positive IDs.
+// the lowest possible int64. It is useful for migrations, so when the system becomes
+// active and a concurrent generator is used, clashes are avoided implicitly
+// (since the following generator would only produce positive IDs).
 func NewNegSequential() Interface {
 	return &sequential{value: int64(-(1 << 63))}
 }
@@ -63,9 +65,9 @@ func NewOverflowChecker(allowedBits byte, gen Interface) Interface {
 	}
 }
 
-// NewTimestamp returns an ID generator that uses the machine clock (Millisec precision).
-// Not safe for concurrent use by itself (neither does it check for clashes), since
-// resolution is in Milliseconds.
+// NewTimestamp returns an ID generator that uses the machine clock (Millisecond precision).
+// So it is safe for concurrent use by itself (neither does it check for clashes).
+// It's NewIDs method only accepts n=1.
 func NewTimestamp() Interface {
 	return tstamp{}
 }
@@ -76,20 +78,23 @@ func NewTimestamp() Interface {
 type (
 	// constant is used to implement the nodeMask in Snowflake.
 	// It cannot generated more than one ID at once.
-	constant   int64
+	constant int64
+	// sequential generates IDs by adding to internal counter. It's safe for concurrent use.
 	sequential struct {
 		value int64
 	}
-	tstamp          struct{}
+	tstamp struct{}
+	// overflowChecker executes gen and checks for overflow.
 	overflowChecker struct {
 		gen          Interface
 		overflowBits int64
 	}
-	// shifted wraps another generator to left-shift its bits.
+	// shifted executen gen and left-shifts the generated ID's bits.
 	shifted struct {
 		gen  Interface
 		bits byte
 	}
+	// snowflake combines a timestamp, a (constant) nodeMask and a sequence.
 	snowflake struct {
 		sync.Mutex
 		lastTimestamp int64
@@ -100,24 +105,20 @@ type (
 	}
 )
 
-// NewIDs always returns the same constants, and only accepts n=1.
 func (c constant) NewIDs(n int64) (int64, error) {
-	if err := checkNIsOne(c, 1, n); err != nil {
+	if err := checkNIsOne(c, n); err != nil {
 		return 0, err
 	}
 	return int64(c), nil
 }
 
-// NewIDs uses the machine clock and it only accepts n=1.
-// Not safe for concurrent use by itself, since resolution is in Milliseconds.
 func (t tstamp) NewIDs(n int64) (int64, error) {
-	if err := checkNIsOne(t, 1, n); err != nil {
+	if err := checkNIsOne(t, n); err != nil {
 		return 0, err
 	}
 	return time.Now().UnixNano() / int64(time.Millisecond), nil
 }
 
-// NewIDs executes the wrapped generator and checks for overflow.
 func (o overflowChecker) NewIDs(n int64) (int64, error) {
 	v, err := o.gen.NewIDs(n)
 	if err != nil {
@@ -129,7 +130,6 @@ func (o overflowChecker) NewIDs(n int64) (int64, error) {
 	return v, nil
 }
 
-// NewIDs executes the wrapped generator and shifts its result.
 func (s shifted) NewIDs(n int64) (int64, error) {
 	v, err := s.gen.NewIDs(n)
 	if err != nil {
@@ -138,7 +138,6 @@ func (s shifted) NewIDs(n int64) (int64, error) {
 	return v << s.bits, nil
 }
 
-// NewIDs ands n to the internal counter and returns it. It's safe for concurrent use.
 func (s *sequential) NewIDs(n int64) (int64, error) {
 	return atomic.AddInt64(&s.value, n), nil
 }
@@ -148,8 +147,6 @@ func (s *sequential) reset(v int64) {
 	atomic.StoreInt64(&s.value, v)
 }
 
-// NewIDs combines a timestamp, a (constant) nodeMask and a sequence.
-// Safe for concurrent use.
 func (s *snowflake) NewIDs(n int64) (int64, error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
@@ -175,10 +172,10 @@ func (s *snowflake) NewIDs(n int64) (int64, error) {
 	return tstamp | nodeMask | seqNum, nil
 }
 
-func checkNIsOne(gen Interface, max, n int64) error {
-	if n != max {
-		return fmt.Errorf("%T/%v.NewIDs() supports count=%v, got %v",
-			gen, gen, max, n)
+func checkNIsOne(gen Interface, n int64) error {
+	if n != 1 {
+		return fmt.Errorf("%T/%v.NewIDs() supports count=1, got %v",
+			gen, gen, n)
 	}
 	return nil
 }
